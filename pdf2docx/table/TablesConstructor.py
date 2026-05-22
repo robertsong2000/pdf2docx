@@ -293,7 +293,15 @@ class TablesConstructor:
         if page_frame_like:
             return True
 
-        return False
+        heading_band_like = (
+            table.num_rows <= 4
+            and table.num_cols >= 2
+            and width_ratio >= 0.55
+            and height_ratio <= 0.18
+            and table.bbox.y0 >= layout_bbox.y0 + layout_bbox.height * 0.08
+            and table.bbox.y0 <= layout_bbox.y0 + layout_bbox.height * 0.45
+        )
+        return heading_band_like
 
 
     @staticmethod
