@@ -26,6 +26,7 @@ from ..layout.Blocks import Blocks
 from ..shape.Shapes import Shapes
 from ..text.Lines import Lines
 from .TableStructure import TableStructure
+from .TableBlock import TableBlock
 from .Border import Border, Borders
 from .Cell import Cell
 
@@ -110,6 +111,7 @@ class TablesConstructor:
 
         # parse table with each group
         tables = Blocks()
+        page_frame_lattice_cells = []
         settings = {
             'min_border_clearance': min_border_clearance,
             'max_border_width': max_border_width
@@ -124,8 +126,19 @@ class TablesConstructor:
                 if self._is_spec_false_lattice_table(table, self._parent.bbox, ignore_page_frame_tables):
                     self._parent.page_frame_table_ignored = True
                     continue
+                if (
+                    ignore_page_frame_tables
+                    and table.num_rows == 1
+                    and table.num_cols == 1
+                    and self._is_inner_page_frame_cell(table, self._parent.bbox)
+                ):
+                    page_frame_lattice_cells.append(table)
+                    continue
                 table.set_lattice_table_block()
                 tables.append(table)            
+
+        if page_frame_lattice_cells:
+            tables.extend(self._merge_page_frame_lattice_cells(page_frame_lattice_cells))
 
         # assign blocks/shapes to each table
         self._blocks.assign_to_tables(tables)
@@ -149,19 +162,11 @@ class TablesConstructor:
         # lines in potential stream tables
         tables_lines = self._blocks.collect_stream_lines(table_fillings, line_separate_threshold)
         if getattr(self._parent, 'page_frame_table_ignored', False):
-            top_limit = self._parent.bbox.y0 + self._parent.bbox.height * 0.55
             filtered_tables_lines = []
             for table_lines in tables_lines:
-                if table_lines.bbox.y0 >= top_limit:
-                    filtered_tables_lines.append(table_lines)
-                    continue
-
-                leading_table_lines = self._leading_compact_stream_table_lines(
-                    table_lines,
-                    self._parent.bbox
+                filtered_tables_lines.extend(
+                    self._compact_stream_table_line_groups(table_lines, self._parent.bbox)
                 )
-                if leading_table_lines:
-                    filtered_tables_lines.append(leading_table_lines)
 
             tables_lines = filtered_tables_lines
 
@@ -305,50 +310,180 @@ class TablesConstructor:
 
 
     @staticmethod
-    def _leading_compact_stream_table_lines(lines:Lines, layout_bbox):
+    def _is_inner_page_frame_cell(table, layout_bbox):
+        if not layout_bbox or not table.bbox:
+            return False
+
+        width_ratio = table.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
+        height_ratio = table.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
+        return (
+            width_ratio <= 0.35
+            and height_ratio <= 0.20
+            and table.bbox.y0 >= layout_bbox.y0 + layout_bbox.height * 0.20
+        )
+
+
+    def _merge_page_frame_lattice_cells(self, tables:list):
+        def expanded_intersects(a, b, gap=4.0):
+            bbox = a.bbox + (-gap, -gap, gap, gap)
+            return bbox.intersects(b.bbox)
+
+        def group_axis(items, center_attr, size_attr):
+            groups = []
+            for item in sorted(items, key=lambda table: getattr(table.bbox, center_attr)):
+                item_center = getattr(item.bbox, center_attr)
+                for group in groups:
+                    group_center = sum(getattr(table.bbox, center_attr) for table in group) / len(group)
+                    group_size = max(
+                        getattr(table.bbox, size_attr)
+                        for table in group
+                    )
+                    if abs(item_center - group_center) <= max(group_size, 1.0) * 0.6:
+                        group.append(item)
+                        break
+                else:
+                    groups.append([item])
+            return groups
+
+        merged_tables = Blocks()
+        for group in Collection(tables).group(expanded_intersects):
+            if len(group) < 4:
+                continue
+
+            row_groups = group_axis(group, 'y0', 'height')
+            col_groups = group_axis(group, 'x0', 'width')
+            if len(row_groups) < 2 or len(col_groups) < 3:
+                continue
+
+            row_edges = [
+                (
+                    min(table.bbox.y0 for table in row_group),
+                    max(table.bbox.y1 for table in row_group)
+                )
+                for row_group in row_groups
+            ]
+            col_edges = [
+                (
+                    min(table.bbox.x0 for table in col_group),
+                    max(table.bbox.x1 for table in col_group)
+                )
+                for col_group in col_groups
+            ]
+
+            y0 = min(edge[0] for edge in row_edges)
+            y1 = max(edge[1] for edge in row_edges)
+            max_cell_x1 = max(edge[1] for edge in col_edges)
+            trailing_blocks = [
+                block for block in self._blocks
+                if block.bbox.y0 >= y0
+                and block.bbox.y1 <= y1
+                and block.bbox.x0 >= max_cell_x1 - constants.MINOR_DIST
+            ]
+            if trailing_blocks:
+                trailing_x1 = max(block.bbox.x1 for block in trailing_blocks)
+                if trailing_x1 > max_cell_x1 + constants.MINOR_DIST:
+                    col_edges.append((max_cell_x1, trailing_x1))
+
+            raw_rows = []
+            for row_y0, row_y1 in row_edges:
+                raw_cells = []
+                for col_x0, col_x1 in col_edges:
+                    raw_cells.append({
+                        'bbox': (col_x0, row_y0, col_x1, row_y1),
+                        'border_color': (0, 0, 0, 0),
+                        'border_width': (0.5, 0.5, 0.5, 0.5),
+                        'merged_cells': (1, 1)
+                    })
+                raw_rows.append({
+                    'bbox': (col_edges[0][0], row_y0, col_edges[-1][1], row_y1),
+                    'height': row_y1 - row_y0,
+                    'cells': raw_cells
+                })
+
+            table = TableBlock({
+                'bbox': (
+                    col_edges[0][0],
+                    row_edges[0][0],
+                    col_edges[-1][1],
+                    row_edges[-1][1]
+                ),
+                'rows': raw_rows
+            })
+            table.set_lattice_table_block()
+            merged_tables.append(table)
+
+        return merged_tables
+
+
+    @staticmethod
+    def _compact_stream_table_line_groups(lines:Lines, layout_bbox):
         if not layout_bbox or not lines:
-            return None
+            return []
 
         rows = lines.group_by_physical_rows(sorted=True)
         if len(rows) < 2:
-            return None
+            return []
 
         for row in rows:
             row.sort_in_line_order()
 
-        candidate_rows = [rows[0]]
-        previous_row = rows[0]
-        for row in rows[1:]:
-            previous_height = max(previous_row.bbox.height, 1.0)
-            vertical_gap = row.bbox.y0 - previous_row.bbox.y1
-            if vertical_gap > previous_height * 1.5:
-                break
+        def row_is_matrix_like(row):
+            # A real table row has multiple independently positioned cells.
+            # A page-frame failure often mixes these rows with long one-column
+            # requirement text; keep only the compact multi-cell runs.
+            return len(row) >= 3
+
+        def build_lines(candidate_rows):
+            candidate_lines = Lines()
+            for candidate_row in candidate_rows:
+                candidate_lines.extend(candidate_row)
+            return candidate_lines
+
+        def accept(candidate_rows):
+            if len(candidate_rows) < 2:
+                return None
+
+            candidate_lines = build_lines(candidate_rows)
+            width_ratio = candidate_lines.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
+            height_ratio = candidate_lines.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
+            max_row_cells = max(len(row) for row in candidate_rows)
+
+            compact_matrix_like = (
+                max_row_cells >= 3
+                and 0.25 <= width_ratio <= 0.98
+                and height_ratio <= 0.28
+            )
+            return candidate_lines if compact_matrix_like else None
+
+        groups = []
+        candidate_rows = []
+        previous_row = None
+        for row in rows:
+            if not row_is_matrix_like(row):
+                accepted = accept(candidate_rows)
+                if accepted:
+                    groups.append(accepted)
+                candidate_rows = []
+                previous_row = None
+                continue
+
+            if previous_row is not None:
+                previous_height = max(previous_row.bbox.height, 1.0)
+                vertical_gap = row.bbox.y0 - previous_row.bbox.y1
+                if vertical_gap > previous_height * 1.8:
+                    accepted = accept(candidate_rows)
+                    if accepted:
+                        groups.append(accepted)
+                    candidate_rows = []
 
             candidate_rows.append(row)
             previous_row = row
 
-        if len(candidate_rows) < 2:
-            return None
+        accepted = accept(candidate_rows)
+        if accepted:
+            groups.append(accepted)
 
-        candidate_lines = Lines()
-        for row in candidate_rows:
-            candidate_lines.extend(row)
-
-        width_ratio = candidate_lines.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
-        height_ratio = candidate_lines.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
-        max_row_cells = max(len(row) for row in candidate_rows)
-        num_cols = len(candidate_lines.group_by_columns())
-
-        compact_matrix_like = (
-            max_row_cells >= 3
-            and num_cols >= 2
-            and 0.25 <= width_ratio <= 0.70
-            and height_ratio <= 0.12
-        )
-        if compact_matrix_like:
-            return candidate_lines
-
-        return None
+        return groups
 
 
     @staticmethod
