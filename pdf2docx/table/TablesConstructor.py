@@ -42,7 +42,8 @@ class TablesConstructor:
     def lattice_tables(self, 
                 connected_border_tolerance:float,
                 min_border_clearance:float,
-                max_border_width:float):
+                max_border_width:float,
+                ignore_page_frame_tables:bool=False):
         """Parse table with explicit borders/shadings represented by rectangle shapes.
 
         Args:
@@ -51,6 +52,28 @@ class TablesConstructor:
             max_border_width (float): Max border width.
         """
         if not self._shapes: return
+
+        def is_page_frame_candidate(instance) -> bool:
+            if not ignore_page_frame_tables:
+                return False
+
+            layout_bbox = self._parent.bbox
+            if not layout_bbox or not instance.bbox:
+                return False
+
+            layout_area = layout_bbox.get_area()
+            if not layout_area:
+                return False
+
+            width_ratio = instance.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
+            height_ratio = instance.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
+            area_ratio = instance.bbox.get_area() / layout_area
+
+            return (
+                width_ratio >= 0.75
+                and height_ratio >= 0.45
+                and area_ratio >= 0.45
+            )
 
         def remove_overlap(instances:list):
             '''Delete group when it's contained in a certain group.'''
@@ -67,6 +90,9 @@ class TablesConstructor:
                     sorted_group = sorted(group_instances, 
                         key=lambda instance: instance.bbox.get_area())
                     instance = sorted_group[-1]
+                    if is_page_frame_candidate(instance):
+                        unique_groups.extend(sorted_group[:-1])
+                        continue
                 
                 unique_groups.append(instance)
             
@@ -95,6 +121,9 @@ class TablesConstructor:
             # parse table structure
             table = TableStructure(strokes, **settings).parse(group_fills).to_table_block()
             if table:
+                if self._is_spec_false_lattice_table(table, self._parent.bbox, ignore_page_frame_tables):
+                    self._parent.page_frame_table_ignored = True
+                    continue
                 table.set_lattice_table_block()
                 tables.append(table)            
 
@@ -118,7 +147,23 @@ class TablesConstructor:
         table_fillings = self._shapes.table_fillings
 
         # lines in potential stream tables
-        tables_lines = self._blocks.collect_stream_lines(table_fillings, line_separate_threshold)            
+        tables_lines = self._blocks.collect_stream_lines(table_fillings, line_separate_threshold)
+        if getattr(self._parent, 'page_frame_table_ignored', False):
+            top_limit = self._parent.bbox.y0 + self._parent.bbox.height * 0.55
+            filtered_tables_lines = []
+            for table_lines in tables_lines:
+                if table_lines.bbox.y0 >= top_limit:
+                    filtered_tables_lines.append(table_lines)
+                    continue
+
+                leading_table_lines = self._leading_compact_stream_table_lines(
+                    table_lines,
+                    self._parent.bbox
+                )
+                if leading_table_lines:
+                    filtered_tables_lines.append(leading_table_lines)
+
+            tables_lines = filtered_tables_lines
 
         # define a function to get the vertical boundaries of given table
         X0, Y0, X1, Y1 = self._parent.bbox
@@ -220,6 +265,90 @@ class TablesConstructor:
             return len(lines.group_by_physical_rows())==len(lines.group_by_rows())
         else:
             return False
+
+
+    @staticmethod
+    def _is_spec_false_lattice_table(table, layout_bbox, enabled:bool):
+        if not enabled:
+            return False
+
+        if not layout_bbox or not table.bbox:
+            return False
+
+        layout_area = layout_bbox.get_area()
+        if not layout_area:
+            return False
+
+        width_ratio = table.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
+        height_ratio = table.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
+        area_ratio = table.bbox.get_area() / layout_area
+
+        page_frame_like = (
+            table.num_rows >= 4
+            and table.num_cols >= 4
+            and width_ratio >= 0.75
+            and height_ratio >= 0.45
+            and area_ratio >= 0.45
+        )
+        if page_frame_like:
+            return True
+
+        heading_band_like = (
+            table.num_rows <= 4
+            and table.num_cols >= 2
+            and width_ratio >= 0.55
+            and height_ratio <= 0.18
+            and table.bbox.y0 >= layout_bbox.y0 + layout_bbox.height * 0.08
+            and table.bbox.y0 <= layout_bbox.y0 + layout_bbox.height * 0.45
+        )
+        return heading_band_like
+
+
+    @staticmethod
+    def _leading_compact_stream_table_lines(lines:Lines, layout_bbox):
+        if not layout_bbox or not lines:
+            return None
+
+        rows = lines.group_by_physical_rows(sorted=True)
+        if len(rows) < 2:
+            return None
+
+        for row in rows:
+            row.sort_in_line_order()
+
+        candidate_rows = [rows[0]]
+        previous_row = rows[0]
+        for row in rows[1:]:
+            previous_height = max(previous_row.bbox.height, 1.0)
+            vertical_gap = row.bbox.y0 - previous_row.bbox.y1
+            if vertical_gap > previous_height * 1.5:
+                break
+
+            candidate_rows.append(row)
+            previous_row = row
+
+        if len(candidate_rows) < 2:
+            return None
+
+        candidate_lines = Lines()
+        for row in candidate_rows:
+            candidate_lines.extend(row)
+
+        width_ratio = candidate_lines.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
+        height_ratio = candidate_lines.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
+        max_row_cells = max(len(row) for row in candidate_rows)
+        num_cols = len(candidate_lines.group_by_columns())
+
+        compact_matrix_like = (
+            max_row_cells >= 3
+            and num_cols >= 2
+            and 0.25 <= width_ratio <= 0.70
+            and height_ratio <= 0.12
+        )
+        if compact_matrix_like:
+            return candidate_lines
+
+        return None
 
 
     @staticmethod

@@ -106,6 +106,7 @@ class Converter:
             'extract_stream_table'           : False,  # don't consider stream table when extracting tables
             'parse_lattice_table'            : True,   # whether parse lattice table or not; may destroy the layout if set False
             'parse_stream_table'             : True,   # whether parse stream table or not; may destroy the layout if set False
+            'ignore_page_frame_tables'       : False,  # ignore lattice tables that look like page frames
             'delete_end_line_hyphen'         : False,  # delete hyphen at the end of a line
             'raw_exceptions'                 : False,  # Don't swallow exceptions
             'list_not_table'                 : True,   # Avoid treating bullet list as table.

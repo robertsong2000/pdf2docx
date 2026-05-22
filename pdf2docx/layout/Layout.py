@@ -143,7 +143,8 @@ class Layout(Element, ABC):
             self._table_parser.lattice_tables(
                 settings['connected_border_tolerance'],
                 settings['min_border_clearance'],
-                settings['max_border_width'])
+                settings['max_border_width'],
+                settings['ignore_page_frame_tables'])
 
         # parse table structure based on implicit layout of text blocks
         if settings['parse_stream_table']:
