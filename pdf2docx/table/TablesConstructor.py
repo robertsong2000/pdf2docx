@@ -26,7 +26,6 @@ from ..layout.Blocks import Blocks
 from ..shape.Shapes import Shapes
 from ..text.Lines import Lines
 from .TableStructure import TableStructure
-from .TableBlock import TableBlock
 from .Border import Border, Borders
 from .Cell import Cell
 
@@ -54,28 +53,6 @@ class TablesConstructor:
         """
         if not self._shapes: return
 
-        def is_page_frame_candidate(instance) -> bool:
-            if not ignore_page_frame_tables:
-                return False
-
-            layout_bbox = self._parent.bbox
-            if not layout_bbox or not instance.bbox:
-                return False
-
-            layout_area = layout_bbox.get_area()
-            if not layout_area:
-                return False
-
-            width_ratio = instance.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
-            height_ratio = instance.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
-            area_ratio = instance.bbox.get_area() / layout_area
-
-            return (
-                width_ratio >= 0.75
-                and height_ratio >= 0.45
-                and area_ratio >= 0.45
-            )
-
         def remove_overlap(instances:list):
             '''Delete group when it's contained in a certain group.'''
             # group instances if contained in other instance
@@ -91,8 +68,19 @@ class TablesConstructor:
                     sorted_group = sorted(group_instances, 
                         key=lambda instance: instance.bbox.get_area())
                     instance = sorted_group[-1]
-                    if is_page_frame_candidate(instance):
-                        unique_groups.extend(sorted_group[:-1])
+                    if self._is_page_frame_stroke_group(
+                        instance,
+                        self._parent.bbox,
+                        ignore_page_frame_tables
+                    ):
+                        self._parent.page_frame_table_ignored = True
+                        unique_groups.extend(
+                            self._merge_page_frame_inner_stroke_groups(
+                                sorted_group[:-1],
+                                instance,
+                                connected_border_tolerance
+                            )
+                        )
                         continue
                 
                 unique_groups.append(instance)
@@ -111,7 +99,6 @@ class TablesConstructor:
 
         # parse table with each group
         tables = Blocks()
-        page_frame_lattice_cells = []
         settings = {
             'min_border_clearance': min_border_clearance,
             'max_border_width': max_border_width
@@ -126,19 +113,8 @@ class TablesConstructor:
                 if self._is_spec_false_lattice_table(table, self._parent.bbox, ignore_page_frame_tables):
                     self._parent.page_frame_table_ignored = True
                     continue
-                if (
-                    ignore_page_frame_tables
-                    and table.num_rows == 1
-                    and table.num_cols == 1
-                    and self._is_inner_page_frame_cell(table, self._parent.bbox)
-                ):
-                    page_frame_lattice_cells.append(table)
-                    continue
                 table.set_lattice_table_block()
                 tables.append(table)            
-
-        if page_frame_lattice_cells:
-            tables.extend(self._merge_page_frame_lattice_cells(page_frame_lattice_cells))
 
         # assign blocks/shapes to each table
         self._blocks.assign_to_tables(tables)
@@ -310,109 +286,77 @@ class TablesConstructor:
 
 
     @staticmethod
-    def _is_inner_page_frame_cell(table, layout_bbox):
-        if not layout_bbox or not table.bbox:
+    def _is_page_frame_stroke_group(strokes, layout_bbox, enabled:bool):
+        if not enabled:
             return False
 
-        width_ratio = table.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
-        height_ratio = table.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
+        if not layout_bbox or not strokes or not strokes.bbox:
+            return False
+
+        layout_area = layout_bbox.get_area()
+        if not layout_area:
+            return False
+
+        width_ratio = strokes.bbox.width / layout_bbox.width if layout_bbox.width else 0.0
+        height_ratio = strokes.bbox.height / layout_bbox.height if layout_bbox.height else 0.0
+        area_ratio = strokes.bbox.get_area() / layout_area
+
         return (
-            width_ratio <= 0.35
-            and height_ratio <= 0.20
-            and table.bbox.y0 >= layout_bbox.y0 + layout_bbox.height * 0.20
+            width_ratio >= 0.75
+            and height_ratio >= 0.45
+            and area_ratio >= 0.45
         )
 
 
-    def _merge_page_frame_lattice_cells(self, tables:list):
+    @staticmethod
+    def _merge_page_frame_inner_stroke_groups(contained_groups:list, page_frame_strokes, connected_border_tolerance:float):
+        """Merge inner stroke fragments before table parsing."""
+        if not contained_groups:
+            return []
+
         def expanded_intersects(a, b, gap=4.0):
-            bbox = a.bbox + (-gap, -gap, gap, gap)
-            return bbox.intersects(b.bbox)
+            return a.bbox.get_area() and b.bbox.get_area() and \
+                a.bbox.intersects(b.bbox + (-gap, -gap, gap, gap))
 
-        def group_axis(items, center_attr, size_attr):
-            groups = []
-            for item in sorted(items, key=lambda table: getattr(table.bbox, center_attr)):
-                item_center = getattr(item.bbox, center_attr)
-                for group in groups:
-                    group_center = sum(getattr(table.bbox, center_attr) for table in group) / len(group)
-                    group_size = max(
-                        getattr(table.bbox, size_attr)
-                        for table in group
-                    )
-                    if abs(item_center - group_center) <= max(group_size, 1.0) * 0.6:
-                        group.append(item)
-                        break
-                else:
-                    groups.append([item])
-            return groups
+        def stroke_near_cluster(stroke, cluster_bbox, gap=4.0):
+            bbox = stroke.bbox
+            expanded = cluster_bbox + (-gap, -gap, gap, gap)
+            if bbox.intersects(expanded):
+                return True
 
-        merged_tables = Blocks()
-        for group in Collection(tables).group(expanded_intersects):
-            if len(group) < 4:
-                continue
-
-            row_groups = group_axis(group, 'y0', 'height')
-            col_groups = group_axis(group, 'x0', 'width')
-            if len(row_groups) < 2 or len(col_groups) < 3:
-                continue
-
-            row_edges = [
-                (
-                    min(table.bbox.y0 for table in row_group),
-                    max(table.bbox.y1 for table in row_group)
+            if getattr(stroke, 'horizontal', False):
+                return (
+                    bbox.y0 <= expanded.y1
+                    and bbox.y1 >= expanded.y0
+                    and bbox.x0 <= expanded.x1
+                    and bbox.x1 >= expanded.x0
                 )
-                for row_group in row_groups
-            ]
-            col_edges = [
-                (
-                    min(table.bbox.x0 for table in col_group),
-                    max(table.bbox.x1 for table in col_group)
+
+            if getattr(stroke, 'vertical', False):
+                return (
+                    bbox.x0 <= expanded.x1
+                    and bbox.x1 >= expanded.x0
+                    and bbox.y0 <= expanded.y1
+                    and bbox.y1 >= expanded.y0
                 )
-                for col_group in col_groups
-            ]
 
-            y0 = min(edge[0] for edge in row_edges)
-            y1 = max(edge[1] for edge in row_edges)
-            max_cell_x1 = max(edge[1] for edge in col_edges)
-            trailing_blocks = [
-                block for block in self._blocks
-                if block.bbox.y0 >= y0
-                and block.bbox.y1 <= y1
-                and block.bbox.x0 >= max_cell_x1 - constants.MINOR_DIST
-            ]
-            if trailing_blocks:
-                trailing_x1 = max(block.bbox.x1 for block in trailing_blocks)
-                if trailing_x1 > max_cell_x1 + constants.MINOR_DIST:
-                    col_edges.append((max_cell_x1, trailing_x1))
+            return False
 
-            raw_rows = []
-            for row_y0, row_y1 in row_edges:
-                raw_cells = []
-                for col_x0, col_x1 in col_edges:
-                    raw_cells.append({
-                        'bbox': (col_x0, row_y0, col_x1, row_y1),
-                        'border_color': (0, 0, 0, 0),
-                        'border_width': (0.5, 0.5, 0.5, 0.5),
-                        'merged_cells': (1, 1)
-                    })
-                raw_rows.append({
-                    'bbox': (col_edges[0][0], row_y0, col_edges[-1][1], row_y1),
-                    'height': row_y1 - row_y0,
-                    'cells': raw_cells
-                })
+        merged_groups = []
+        for group_cluster in Collection(contained_groups).group(expanded_intersects):
+            strokes = []
+            for group in group_cluster:
+                strokes.extend(list(group))
 
-            table = TableBlock({
-                'bbox': (
-                    col_edges[0][0],
-                    row_edges[0][0],
-                    col_edges[-1][1],
-                    row_edges[-1][1]
-                ),
-                'rows': raw_rows
-            })
-            table.set_lattice_table_block()
-            merged_tables.append(table)
+            cluster_bbox = group_cluster.bbox
+            for stroke in page_frame_strokes:
+                if stroke_near_cluster(stroke, cluster_bbox, gap=max(connected_border_tolerance * 2.0, 4.0)):
+                    strokes.append(stroke)
 
-        return merged_tables
+            if strokes:
+                merged_groups.append(page_frame_strokes.__class__(strokes))
+
+        return merged_groups
 
 
     @staticmethod
