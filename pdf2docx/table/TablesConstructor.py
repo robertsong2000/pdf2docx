@@ -274,15 +274,7 @@ class TablesConstructor:
         if page_frame_like:
             return True
 
-        heading_band_like = (
-            table.num_rows <= 4
-            and table.num_cols >= 2
-            and width_ratio >= 0.55
-            and height_ratio <= 0.18
-            and table.bbox.y0 >= layout_bbox.y0 + layout_bbox.height * 0.08
-            and table.bbox.y0 <= layout_bbox.y0 + layout_bbox.height * 0.45
-        )
-        return heading_band_like
+        return False
 
 
     @staticmethod
@@ -321,23 +313,25 @@ class TablesConstructor:
         def stroke_near_cluster(stroke, cluster_bbox, gap=4.0):
             bbox = stroke.bbox
             expanded = cluster_bbox + (-gap, -gap, gap, gap)
-            if bbox.intersects(expanded):
-                return True
+            right_extension = max(cluster_bbox.width * 0.35, 120.0)
+            max_x1 = expanded.x1 + right_extension
 
             if getattr(stroke, 'horizontal', False):
                 return (
-                    bbox.y0 <= expanded.y1
-                    and bbox.y1 >= expanded.y0
+                    bbox.x0 >= expanded.x0
                     and bbox.x0 <= expanded.x1
-                    and bbox.x1 >= expanded.x0
+                    and bbox.x1 <= max_x1
+                    and bbox.y0 <= expanded.y1
+                    and bbox.y1 >= expanded.y0
                 )
 
             if getattr(stroke, 'vertical', False):
                 return (
-                    bbox.x0 <= expanded.x1
+                    bbox.y0 >= expanded.y0
+                    and bbox.y1 <= expanded.y1
+                    and bbox.x0 <= expanded.x1
                     and bbox.x1 >= expanded.x0
-                    and bbox.y0 <= expanded.y1
-                    and bbox.y1 >= expanded.y0
+                    and bbox.x1 <= max_x1
                 )
 
             return False
